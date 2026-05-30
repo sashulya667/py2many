@@ -209,10 +209,19 @@ class CppTranspiler(CLikeTranspiler):
     def visit_Attribute(self, node) -> str:
         attr = node.attr
         value_id = self.visit(node.value)
+        container_kind = self._container_kind(node.value)
 
         if is_list(node.value):
             if node.attr == "append":
                 attr = "push_back"
+        elif hasattr(node.value, "container_type"):
+            container_type, _ = node.value.container_type
+            if str(container_type).strip().lower() == "list" and node.attr == "append":
+                attr = "push_back"
+        elif container_kind == "list" and node.attr == "append":
+            attr = "push_back"
+        elif container_kind == "set" and node.attr == "add":
+            attr = "insert"
 
         if value_id in {"string"}:
             return f"std::{value_id}::{attr}"
@@ -232,6 +241,53 @@ class CppTranspiler(CLikeTranspiler):
             return ret(self, node, value_id, attr)
 
         return ret
+
+    def _container_kind(self, node) -> str:
+        if isinstance(node, ast.Name) and hasattr(node, "scopes"):
+            definition = node.scopes.find(get_id(node))
+            if definition is not None:
+                if hasattr(definition, "container_type"):
+                    container_type, _ = definition.container_type
+                    return str(container_type).strip().lower()
+                definition_annotation = getattr(definition, "annotation", None)
+                generic_container_type = getattr(
+                    definition_annotation, "generic_container_type", None
+                )
+                if generic_container_type:
+                    container_type = generic_container_type[0]
+                    return str(container_type).strip().lower()
+                assigned_from = getattr(definition, "assigned_from", None)
+                if isinstance(assigned_from, ast.Assign):
+                    value = assigned_from.value
+                    if isinstance(value, ast.List):
+                        return "list"
+                    if isinstance(value, ast.Set):
+                        return "set"
+                    if isinstance(value, ast.Dict):
+                        return "dict"
+        if hasattr(node, "container_type"):
+            container_type, _ = node.container_type
+            return str(container_type).strip().lower()
+        annotation = getattr(node, "annotation", None)
+        generic_container_type = getattr(annotation, "generic_container_type", None)
+        if generic_container_type:
+            container_type = generic_container_type[0]
+            return str(container_type).strip().lower()
+        generic_container_type = getattr(node, "generic_container_type", None)
+        if generic_container_type:
+            container_type = generic_container_type[0]
+            return str(container_type).strip().lower()
+        try:
+            inferred = decltype(node)
+        except Exception:
+            return ""
+        if inferred.startswith("std::vector<"):
+            return "list"
+        if inferred.startswith("std::set<"):
+            return "set"
+        if inferred.startswith("std::map<"):
+            return "dict"
+        return ""
 
     def visit_ClassDef(self, node) -> str:
         extractor = DeclarationExtractor(CppTranspiler())
@@ -345,6 +401,73 @@ class CppTranspiler(CLikeTranspiler):
         if node.keywords:
             vargs += [self.visit(kw.value) for kw in node.keywords]
 
+        if isinstance(node.func, ast.Attribute):
+            value_node = node.func.value
+            value_expr = self.visit(value_node)
+            container_kind = self._container_kind(value_node)
+            attr = node.func.attr
+
+            if attr == "append" and len(vargs) == 1:
+                return f"{value_expr}.push_back({vargs[0]})"
+            if attr == "add" and len(vargs) == 1:
+                return f"{value_expr}.insert({vargs[0]})"
+            if attr == "remove" and len(vargs) == 1:
+                return f"{value_expr}.erase({vargs[0]})"
+            if attr == "keys" and len(vargs) == 0:
+                self._usings.add("<type_traits>")
+                self._usings.add("<vector>")
+                return (
+                    "([](const auto& __m) { "
+                    "using __KeyT = typename std::decay<decltype(__m.begin()->first)>::type; "
+                    "std::vector<__KeyT> __keys; "
+                    "for (const auto& __kv : __m) __keys.push_back(__kv.first); "
+                    "return __keys; "
+                    "})("
+                    f"{value_expr}"
+                    ")"
+                )
+            if attr == "values" and len(vargs) == 0:
+                self._usings.add("<type_traits>")
+                self._usings.add("<vector>")
+                return (
+                    "([](const auto& __m) { "
+                    "using __ValueT = typename std::decay<decltype(__m.begin()->second)>::type; "
+                    "std::vector<__ValueT> __values; "
+                    "for (const auto& __kv : __m) __values.push_back(__kv.second); "
+                    "return __values; "
+                    "})("
+                    f"{value_expr}"
+                    ")"
+                )
+            if attr == "get" and len(vargs) == 2:
+                return (
+                    "([](const auto& __m, const auto& __k, const auto& __default) { "
+                    "auto __it = __m.find(__k); "
+                    "return __it == __m.end() ? __default : __it->second; "
+                    "})("
+                    f"{value_expr}, {vargs[0]}, {vargs[1]}"
+                    ")"
+                )
+            if attr == "get" and len(vargs) == 1:
+                self._usings.add("<type_traits>")
+                return (
+                    "([](const auto& __m, const auto& __k) { "
+                    "using __ValueT = typename std::decay<decltype(__m.begin()->second)>::type; "
+                    "auto __it = __m.find(__k); "
+                    "return __it == __m.end() ? __ValueT{} : __it->second; "
+                    "})("
+                    f"{value_expr}, {vargs[0]}"
+                    ")"
+                )
+            if attr == "__contains__" and len(vargs) == 1:
+                if container_kind == "dict":
+                    return f"({value_expr}.find({vargs[0]}) != {value_expr}.end())"
+                self._usings.add("<algorithm>")
+                return (
+                    f"(std::find({value_expr}.begin(), {value_expr}.end(), {vargs[0]}) "
+                    f"!= {value_expr}.end())"
+                )
+
         ret = self._dispatch(node, fname, vargs)
         if ret is not None:
             return ret
@@ -359,7 +482,23 @@ class CppTranspiler(CLikeTranspiler):
         target = self.visit(node.target)
         it = self.visit(node.iter)
         buf = []
-        buf.append(f"for(auto {target} : {it}) {{")
+        iter_kind = self._container_kind(node.iter)
+        if not iter_kind and isinstance(node.iter, ast.Dict):
+            iter_kind = "dict"
+        if not iter_kind and isinstance(node.iter, ast.Name) and hasattr(node.iter, "scopes"):
+            definition = node.iter.scopes.find(get_id(node.iter))
+            assigned_from = getattr(definition, "assigned_from", None) if definition else None
+            if isinstance(assigned_from, ast.Assign):
+                value = assigned_from.value
+                if isinstance(value, ast.Dict):
+                    iter_kind = "dict"
+                elif isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "dict":
+                    iter_kind = "dict"
+        if iter_kind == "dict":
+            buf.append(f"for(const auto& __kv : {it}) {{")
+            buf.append(f"auto {target} = __kv.first;")
+        else:
+            buf.append(f"for(auto {target} : {it}) {{")
         buf.extend([self.visit(c) for c in node.body])
         buf.append("}")
         return "\n".join(buf)
@@ -502,17 +641,18 @@ class CppTranspiler(CLikeTranspiler):
         else:
             return self._default_type
 
+    def _fallback_decltype(self, expr: str, default_type: str = "int") -> str:
+        if not expr or "decltype(auto)" in expr:
+            return default_type
+        return f"decltype({expr})"
+
     def visit_List(self, node) -> str:
         self._usings.add("<vector>")
         elements = [self.visit(e) for e in node.elts]
         elements_str = ", ".join(elements)
         element_type = self._get_element_type(node)
         if element_type == self._default_type:
-            typename = decltype(node)
-            # Workaround for cases where we couldn't figure out type
-            if "auto" in typename:
-                return f"{{{elements_str}}}"
-            return f"{typename}{{{elements_str}}}"
+            return f"{{{elements_str}}}"
         return f"{{{elements_str}}}"
 
     def visit_Set(self, node) -> str:
@@ -521,8 +661,11 @@ class CppTranspiler(CLikeTranspiler):
         elements_str = ", ".join(elements)
         element_type = self._get_element_type(node)
         if element_type == self._default_type:
-            typename = decltype(node)
-            return f"{typename}{{{elements_str}}}"
+            if elements:
+                element_type = self._fallback_decltype(elements[0])
+            else:
+                element_type = "int"
+            return f"std::set<{element_type}>{{{elements_str}}}"
         return f"std::set<{element_type}>{{{elements_str}}}"
 
     def visit_Dict(self, node) -> str:
@@ -537,8 +680,15 @@ class CppTranspiler(CLikeTranspiler):
             if key_typename == self._default_type:
                 key_typename = "int"
         else:
-            typename = decltype(node)
-            return f"{typename}{{{kv_pairs}}}"
+            if keys:
+                key_typename = self._fallback_decltype(keys[0])
+            else:
+                key_typename = "int"
+            if values:
+                value_typename = self._fallback_decltype(values[0])
+            else:
+                value_typename = "int"
+            return f"std::map<{key_typename}, {value_typename}>{{{kv_pairs}}}"
         return f"std::map<{key_typename}, {value_typename}>{{{kv_pairs}}}"
 
     def visit_Subscript(self, node) -> str:
